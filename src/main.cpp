@@ -18,38 +18,38 @@ const float GYRO_SCALE  = 131.0f;   // Skala Giroskop ±250 °/s
 Adafruit_BMP280 bmp;
 
 // Variabel Global
-float alertThreshold = 40.0; // Batas sudut untuk Alert
+float alertThreshold = 40.0;          // batas sudut miring
+float altitudeAlertThreshold = 0.30f;  // batas altitude relatif (meter)
 unsigned long lastTelemetryTime = 0;
 unsigned long lastMicros = 0;
 float gyroBiasX = 0.0f;
 float gyroBiasY = 0.0f;
 
-// buffer serial untuk menerima angka via serial
+// buffer serial
 String serialBuf = "";
+
+// ================= BASELINE (GROUND LEVEL) =================
+float baseAltitude = 135.4f;
+bool altitudeInitialized = true;
+// =========================================================
 
 // ================= STRUKTUR KALMAN FILTER =================
 struct Kalman1D {
-  float q; // Kovarians noise proses
-  float r; // Kovarians noise pengukuran
-  float x; // Estimasi sudut
-  float p; // Kovarians error estimasi
-  float k; // Kalman gain
+  float q, r, x, p, k;
 
   Kalman1D() {
-    q = 0.001f; 
-    r = 0.03f;  
+    q = 0.001f;
+    r = 0.03f;
     x = 0.0f;
     p = 1.0f;
     k = 0.0f;
   }
 
-  // Tahap Prediksi
   void predict(float gyroRate, float dt) {
     x += gyroRate * dt;
     p += q;
   }
 
-  // Tahap Update
   void update(float measAngle) {
     k = p / (p + r);
     x = x + k * (measAngle - x);
@@ -70,12 +70,13 @@ void writeMPURegister(uint8_t reg, uint8_t val) {
   Wire.endTransmission();
 }
 
-void readMPUAccelGyro(int16_t &ax, int16_t &ay, int16_t &az, int16_t &gx, int16_t &gy, int16_t &gz) {
+void readMPUAccelGyro(int16_t &ax, int16_t &ay, int16_t &az,
+                      int16_t &gx, int16_t &gy, int16_t &gz) {
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(ACCEL_XOUT_H);
   Wire.endTransmission(false);
   Wire.requestFrom(MPU_ADDR, (uint8_t)14);
-  
+
   if (Wire.available() >= 14) {
     ax = (Wire.read() << 8) | Wire.read();
     ay = (Wire.read() << 8) | Wire.read();
@@ -96,8 +97,8 @@ float calculatePitch(float ax, float ay, float az) {
 
 void calibrateGyro(int samples = 500) {
   long sumGX = 0, sumGY = 0;
-  Serial.print("Kalibrasi Gyro (" + String(samples) + " sampel)...");
-  for (int i = 0; i < samples; ++i) {
+  Serial.print("Kalibrasi Gyro...");
+  for (int i = 0; i < samples; i++) {
     int16_t ax, ay, az, gx, gy, gz;
     readMPUAccelGyro(ax, ay, az, gx, gy, gz);
     sumGX += gx;
@@ -112,142 +113,114 @@ void calibrateGyro(int samples = 500) {
 // ================= SETUP =================
 void setup() {
   Serial.begin(SERIAL_BAUD);
-  while(!Serial) delay(10); 
-  
-  // Inisialisasi I2C
-  if(!Wire.begin(SDA_PIN, SCL_PIN)) {
-    Serial.println("Error: I2C gagal diinisialisasi.");
-    while(1);
+  while (!Serial) delay(10);
+
+  if (!Wire.begin(SDA_PIN, SCL_PIN)) {
+    Serial.println("Error: I2C gagal!");
+    while (1);
   }
 
-  // --- 1. SETUP BMP280 ---
   bool bmpFound = false;
-  if (bmp.begin(0x76)) {
-    Serial.println("BMP280 OK (0x76)");
-    bmpFound = true;
-  } else if (bmp.begin(0x77)) {
-    Serial.println("BMP280 OK (0x77)");
-    bmpFound = true;
-  } else {
-    Serial.println("PERINGATAN: BMP280 Tidak Terdeteksi!");
-  }
+  if (bmp.begin(0x76)) { bmpFound = true; }
+  else if (bmp.begin(0x77)) { bmpFound = true; }
 
-  if (bmpFound) {
-    bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,
-                    Adafruit_BMP280::SAMPLING_X2,
-                    Adafruit_BMP280::SAMPLING_X16,
-                    Adafruit_BMP280::FILTER_X16,
-                    Adafruit_BMP280::STANDBY_MS_63);
-  }
+  if (!bmpFound) Serial.println("BMP280 tidak ditemukan!");
 
-  // --- 2. SETUP MPU6050 ---
   Wire.beginTransmission(MPU_ADDR);
   if (Wire.endTransmission() != 0) {
-    Serial.println("ERROR: MPU6050 Tidak Terdeteksi!");
-    while(1);
+    Serial.println("MPU6050 tidak terdeteksi!");
+    while (1);
   }
-  
+
   writeMPURegister(PWR_MGMT_1, 0x00);
   delay(100);
   calibrateGyro();
 
-  // Inisialisasi sudut awal dari akselerometer
   int16_t ax, ay, az, gx, gy, gz;
   readMPUAccelGyro(ax, ay, az, gx, gy, gz);
-  float rollInit = calculateRoll(ay, az);
-  float pitchInit = calculatePitch(ax, ay, az);
-  
-  kalmanRoll.setAngle(rollInit);
-  kalmanPitch.setAngle(pitchInit);
-  
+  kalmanRoll.setAngle(calculateRoll(ay, az));
+  kalmanPitch.setAngle(calculatePitch(ax, ay, az));
+
   lastMicros = micros();
-  
-  Serial.println("Sistem Siap.");
-  Serial.printf("Current alertThreshold = %.1f deg\n", alertThreshold);
-  Serial.println("Commands: 'u' = +5 deg, 'd' = -5 deg, or send numeric value then Enter to set directly.");
+
+  Serial.println("Sistem Aktif.");
+  Serial.printf("Threshold awal = %.1f deg\n", alertThreshold);
+  Serial.printf("Altitude baseline = %.2f m\n", baseAltitude);
 }
 
 // ================= LOOP =================
 void loop() {
-  // --- Read Serial commands without blocking ---
+  // Serial input
   while (Serial.available()) {
     char c = Serial.read();
-    if (c == 'u' || c == 'U') {
-      alertThreshold += 5.0f;
-      if (alertThreshold > 180.0f) alertThreshold = 180.0f;
-      Serial.printf("Threshold increased -> %.1f deg\n", alertThreshold);
-    } else if (c == 'd' || c == 'D') {
-      alertThreshold -= 5.0f;
-      if (alertThreshold < 0.0f) alertThreshold = 0.0f;
-      Serial.printf("Threshold decreased -> %.1f deg\n", alertThreshold);
-    } else if (c == '\r' || c == '\n') {
-      // end of numeric input — parse if buffer not empty
+
+    if (c == 'u') {
+      alertThreshold += 5;
+      Serial.printf("Threshold -> %.1f\n", alertThreshold);
+    } 
+    else if (c == 'd') {
+      alertThreshold -= 5;
+      Serial.printf("Threshold -> %.1f\n", alertThreshold);
+    }
+    else if (c == '\n' || c == '\r') {
       if (serialBuf.length() > 0) {
-        float v = serialBuf.toFloat();
-        if (v >= 0.0f && v <= 180.0f) {
-          alertThreshold = v;
-          Serial.printf("Threshold set -> %.1f deg\n", alertThreshold);
-        } else {
-          Serial.println("Nilai tidak valid (0-180).");
-        }
+        alertThreshold = serialBuf.toFloat();
+        Serial.printf("Threshold set -> %.1f\n", alertThreshold);
         serialBuf = "";
       }
-    } else {
-      // accumulate numeric characters (digits, dot, minus)
-      if ((c >= '0' && c <= '9') || c == '.' || c == '-' ) {
-        serialBuf += c;
-      } else {
-        // ignore other characters (but clear if necessary)
-      }
+    }
+    else if (isdigit(c) || c == '.') {
+      serialBuf += c;
     }
   }
 
-  // --- Hitung Delta Time (dt) ---
-  unsigned long nowMicros = micros();
-  float dt = (nowMicros - lastMicros) / 1000000.0f;
-  lastMicros = nowMicros;
+  // Delta time
+  unsigned long now = micros();
+  float dt = (now - lastMicros) / 1e6;
+  lastMicros = now;
 
-  // --- Baca Data Sensor ---
-  int16_t ax_raw, ay_raw, az_raw, gx_raw, gy_raw, gz_raw;
-  readMPUAccelGyro(ax_raw, ay_raw, az_raw, gx_raw, gy_raw, gz_raw);
+  // Sensor read
+  int16_t ax_r, ay_r, az_r, gx_r, gy_r, gz_r;
+  readMPUAccelGyro(ax_r, ay_r, az_r, gx_r, gy_r, gz_r);
 
-  // Konversi ke unit fisik
-  float ax = ax_raw / ACCEL_SCALE;
-  float ay = ay_raw / ACCEL_SCALE;
-  float az = az_raw / ACCEL_SCALE;
-  float gx = (gx_raw - gyroBiasX) / GYRO_SCALE;
-  float gy = (gy_raw - gyroBiasY) / GYRO_SCALE;
+  float ax = ax_r / ACCEL_SCALE;
+  float ay = ay_r / ACCEL_SCALE;
+  float az = az_r / ACCEL_SCALE;
+  float gx = (gx_r - gyroBiasX) / GYRO_SCALE;
+  float gy = (gy_r - gyroBiasY) / GYRO_SCALE;
 
-  // Hitung sudut berdasarkan akselerometer
   float rollAcc = calculateRoll(ay, az);
   float pitchAcc = calculatePitch(ax, ay, az);
 
-  // Proses Kalman Filter
   kalmanRoll.predict(gx, dt);
   kalmanRoll.update(rollAcc);
+
   kalmanPitch.predict(gy, dt);
   kalmanPitch.update(pitchAcc);
 
   float roll = kalmanRoll.getAngle();
   float pitch = kalmanPitch.getAngle();
 
-  // --- Telemetri Serial ---
   if (millis() - lastTelemetryTime >= TELEMETRY_INTERVAL_MS) {
     lastTelemetryTime = millis();
 
-    float alt = NAN;
-    if (bmp.sensorID()) {
-      alt = bmp.readAltitude(1013.25); 
-    }
+    float rawAlt = bmp.readAltitude(1013.25);
+    float adjAlt = rawAlt - baseAltitude;
 
-    // Logika Alert
+    // ===== STATUS ALERT =====
     String status = "NORMAL";
-    if (abs(roll) > alertThreshold) {
-      status = "!!! ALERT: MIRING !!!";
-    }
 
-    // Output Serial Terformat
-    Serial.printf("Time: %5lu ms | Roll: %6.2f | Pitch: %6.2f | Alt: %6.1f m | Th: %5.1f | Sts: %s\n", 
-                  millis(), roll, pitch, alt, alertThreshold, status.c_str());
+    bool rollAlert = abs(roll) > alertThreshold;
+    bool altAlert = adjAlt > altitudeAlertThreshold;
+
+    if (rollAlert && altAlert) status = "!!! ALERT: MIRING + ALTITUDE !!!";
+    else if (rollAlert)        status = "!!! ALERT: MIRING !!!";
+    else if (altAlert)         status = "!!! ALTITUDE ALERT !!!";
+
+    // Output
+    Serial.printf(
+      "Time:%5lu | Roll:%6.2f | Pitch:%6.2f | RawAlt:%6.2f | AdjAlt:%6.2f | Th:%5.1f | %s\n",
+      millis(), roll, pitch, rawAlt, adjAlt, alertThreshold, status.c_str()
+    );
   }
 }
